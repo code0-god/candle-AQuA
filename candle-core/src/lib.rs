@@ -128,7 +128,8 @@ pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(feature = "aqua")]
 pub use aqua_backend::{
-    AquaDevice, AquaDispatch, AquaExecutor, AquaMatMulRequest, AquaStorage, CpuFallbackAquaExecutor,
+    AquaDevice, AquaDispatch, AquaExecutor, AquaGgufTensorRequest, AquaMatMulRequest, AquaStorage,
+    CpuFallbackAquaExecutor,
 };
 
 #[cfg(feature = "mkl")]

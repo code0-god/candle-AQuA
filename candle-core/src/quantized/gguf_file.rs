@@ -96,6 +96,20 @@ impl TensorInfo {
         tensor_data_offset: u64,
         device: &Device,
     ) -> Result<QTensor> {
+        let raw_data = self.read_raw(reader, tensor_data_offset)?;
+        super::ggml_file::qtensor_from_ggml(
+            self.ggml_dtype,
+            &raw_data,
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
+
+    pub fn read_raw<R: std::io::Seek + std::io::Read>(
+        &self,
+        reader: &mut R,
+        tensor_data_offset: u64,
+    ) -> Result<Vec<u8>> {
         let tensor_elems = self.shape.elem_count();
         let block_size = self.ggml_dtype.block_size();
         if !tensor_elems.is_multiple_of(block_size) {
@@ -115,12 +129,7 @@ impl TensorInfo {
         let mut raw_data = vec![0u8; size_in_bytes];
         reader.seek(std::io::SeekFrom::Start(tensor_start))?;
         reader.read_exact(&mut raw_data)?;
-        super::ggml_file::qtensor_from_ggml(
-            self.ggml_dtype,
-            &raw_data,
-            self.shape.dims().to_vec(),
-            device,
-        )
+        Ok(raw_data)
     }
 }
 
@@ -597,7 +606,30 @@ impl Content {
             Some(tensor_info) => tensor_info,
             None => crate::bail!("cannot find tensor info for {name}"),
         };
-        tensor_info.read(reader, self.tensor_data_offset, device)
+        let raw_data = tensor_info.read_raw(reader, self.tensor_data_offset)?;
+        #[cfg(feature = "aqua")]
+        if let Device::Aqua(aqua) = device {
+            aqua.executor()
+                .prepare_gguf_tensor(crate::AquaGgufTensorRequest::new(
+                    name,
+                    &tensor_info.shape,
+                    tensor_info.ggml_dtype,
+                    &raw_data,
+                    self.profile,
+                ))?;
+            return super::ggml_file::qtensor_from_ggml(
+                tensor_info.ggml_dtype,
+                &raw_data,
+                tensor_info.shape.dims().to_vec(),
+                &Device::Cpu,
+            );
+        }
+        super::ggml_file::qtensor_from_ggml(
+            tensor_info.ggml_dtype,
+            &raw_data,
+            tensor_info.shape.dims().to_vec(),
+            device,
+        )
     }
 }
 

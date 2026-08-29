@@ -1,14 +1,18 @@
 #![cfg(feature = "aqua")]
 
-use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::quantized::{
+    gguf_file::{self, GgufTypeProfile, Value},
+    GgmlDType, QTensor,
+};
 use candle_core::{
     backend::{BackendDevice, BackendStorage},
-    AquaDevice, AquaDispatch, AquaExecutor, AquaMatMulRequest, CpuStorage, DType, Device,
-    DeviceLocation, Result, Shape, Tensor,
+    AquaDevice, AquaDispatch, AquaExecutor, AquaGgufTensorRequest, AquaMatMulRequest, CpuStorage,
+    DType, Device, DeviceLocation, Result, Shape, Tensor,
 };
+use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 #[derive(Debug, Default)]
@@ -47,6 +51,40 @@ impl AquaExecutor for MalformedOutputExecutor {
             Self::Length => CpuStorage::F32(vec![0.0; 3]),
         };
         Ok(AquaDispatch::Executed(output))
+    }
+}
+
+#[derive(Debug)]
+struct CapturedGgufTensor {
+    name: String,
+    shape: Shape,
+    dtype: GgmlDType,
+    raw_data: Vec<u8>,
+    profile: GgufTypeProfile,
+}
+
+#[derive(Debug, Default)]
+struct GgufRecordingExecutor {
+    tensors: Mutex<Vec<CapturedGgufTensor>>,
+}
+
+impl AquaExecutor for GgufRecordingExecutor {
+    fn name(&self) -> &'static str {
+        "gguf-recording"
+    }
+
+    fn prepare_gguf_tensor(&self, request: AquaGgufTensorRequest<'_>) -> Result<()> {
+        self.tensors
+            .lock()
+            .expect("capture lock")
+            .push(CapturedGgufTensor {
+                name: request.name().to_owned(),
+                shape: request.shape().clone(),
+                dtype: request.dtype(),
+                raw_data: request.raw_data().to_vec(),
+                profile: request.profile(),
+            });
+        Ok(())
     }
 }
 
@@ -204,5 +242,45 @@ fn quantized_storage_is_explicitly_unsupported() -> Result<()> {
         error.to_string(),
         "quantized storage is not supported on Aqua devices"
     );
+    Ok(())
+}
+
+#[test]
+fn aqua_gguf_hook_preserves_tensor_request_and_cpu_fallback() -> Result<()> {
+    // Given
+    let source = Tensor::from_vec(vec![1.0_f32; 32], (1, 32), &Device::Cpu)?;
+    let source = QTensor::quantize(&source, GgmlDType::Q8HP1)?;
+    let expected_raw = source.data()?.into_owned();
+    let profile = Value::String("q8_hp1".to_owned());
+    let profile_version = Value::U32(1);
+    let quantization_version = Value::U32(2);
+    let file_type = Value::U32(40);
+    let metadata = [
+        ("aqua.gguf.profile", &profile),
+        ("aqua.gguf.profile_version", &profile_version),
+        ("general.quantization_version", &quantization_version),
+        ("general.file_type", &file_type),
+    ];
+    let mut cursor = Cursor::new(Vec::new());
+    gguf_file::write(&mut cursor, &metadata, &[("weight", &source)])?;
+    cursor.set_position(0);
+    let content = gguf_file::Content::read(&mut cursor)?;
+    let concrete = Arc::new(GgufRecordingExecutor::default());
+    let executor: Arc<dyn AquaExecutor> = concrete.clone();
+    let device = Device::new_aqua_with_executor(0, executor)?;
+
+    // When
+    let loaded = content.tensor(&mut cursor, "weight", &device)?;
+
+    // Then
+    assert!(loaded.device().is_cpu());
+    assert_eq!(loaded.data()?.as_ref(), expected_raw);
+    let captured = concrete.tensors.lock().expect("capture lock");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].name, "weight");
+    assert_eq!(captured[0].shape.dims(), &[1, 32]);
+    assert_eq!(captured[0].dtype, GgmlDType::Q8HP1);
+    assert_eq!(captured[0].raw_data, expected_raw);
+    assert_eq!(captured[0].profile, GgufTypeProfile::AquaQ8Hp1);
     Ok(())
 }

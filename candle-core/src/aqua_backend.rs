@@ -3,6 +3,8 @@ use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, DeviceLocation, Error, Layout, Result, Shape, WithDType};
 use std::{fmt, sync::Arc};
 
+pub use gguf::AquaGgufTensorRequest;
+
 /// Result of asking the injected AQuA executor to handle an operation.
 ///
 /// `Executed` means that the external executor produced the result.
@@ -32,6 +34,10 @@ pub struct AquaMatMulRequest<'a> {
 /// types. Candle only provides storage and operation metadata.
 pub trait AquaExecutor: Send + Sync + fmt::Debug {
     fn name(&self) -> &'static str;
+
+    fn prepare_gguf_tensor(&self, _request: AquaGgufTensorRequest<'_>) -> Result<()> {
+        Ok(())
+    }
 
     fn matmul(&self, _request: AquaMatMulRequest<'_>) -> Result<AquaDispatch<CpuStorage>> {
         Ok(AquaDispatch::Fallback)
@@ -270,4 +276,5 @@ impl BackendDevice for AquaDevice {
     }
 }
 
+mod gguf;
 mod storage;
