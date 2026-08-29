@@ -1125,6 +1125,9 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+        GgmlDType::Q8H1 | GgmlDType::Q8HP1 => {
+            bail!("matmul is not implemented for {dtype:?}")
+        }
     };
     Ok(err)
 }

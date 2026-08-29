@@ -2,7 +2,7 @@ use super::utils::{
     get_scale_min_k4, group_for_dequantization, group_for_quantization, make_q3_quants,
     make_qkx1_quants, make_qx_quants, nearest_int,
 };
-use super::GgmlDType;
+use super::{GgmlDType, QK8_H};
 use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
@@ -117,6 +117,64 @@ pub struct BlockQ8_0 {
     pub(crate) qs: [i8; QK8_0],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
+
+// ABI source: ajou-aisa/llama.cpp-gemmini@d5e76be1fca91314c5a0745038b3cedbbdbed13d
+// ggml/src/ggml-common.h (block_q8_h1). C field `R` maps to Rust `r`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+#[repr(C)]
+pub struct BlockQ8H1 {
+    pub(crate) qs: [i8; QK8_H],
+    pub(crate) c_b: u8,
+    pub(crate) _padding: [u8; 3],
+    pub(crate) s_rf: f32,
+    pub(crate) r: u16,
+    pub(crate) _tail_padding: [u8; 2],
+}
+const _: () = {
+    assert!(std::mem::size_of::<BlockQ8H1>() == 44);
+    assert!(std::mem::align_of::<BlockQ8H1>() == 4);
+    assert!(std::mem::offset_of!(BlockQ8H1, qs) == 0);
+    assert!(std::mem::offset_of!(BlockQ8H1, c_b) == 32);
+    assert!(std::mem::offset_of!(BlockQ8H1, _padding) == 33);
+    assert!(std::mem::offset_of!(BlockQ8H1, s_rf) == 36);
+    assert!(std::mem::offset_of!(BlockQ8H1, r) == 40);
+    assert!(std::mem::offset_of!(BlockQ8H1, _tail_padding) == 42);
+};
+
+// ABI source: ajou-aisa/llama.cpp-gemmini@d5e76be1fca91314c5a0745038b3cedbbdbed13d
+// ggml/src/ggml-common.h (block_q8_hp1).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
+#[repr(C)]
+pub struct BlockQ8HP1 {
+    pub(crate) qs: [i8; QK8_H],
+    pub(crate) m: i16,
+    pub(crate) padding: [u8; 2],
+    pub(crate) channel_scale: f32,
+}
+const _: () = {
+    assert!(std::mem::size_of::<BlockQ8HP1>() == 40);
+    assert!(std::mem::align_of::<BlockQ8HP1>() == 4);
+    assert!(std::mem::offset_of!(BlockQ8HP1, qs) == 0);
+    assert!(std::mem::offset_of!(BlockQ8HP1, m) == 32);
+    assert!(std::mem::offset_of!(BlockQ8HP1, padding) == 34);
+    assert!(std::mem::offset_of!(BlockQ8HP1, channel_scale) == 36);
+};
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]

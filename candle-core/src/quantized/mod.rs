@@ -3,6 +3,7 @@ use crate::{
 };
 use k_quants::*;
 use std::{borrow::Cow, sync::OnceLock};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes};
 
 #[cfg(target_feature = "avx2")]
 pub mod avx;
@@ -68,10 +69,7 @@ pub struct QTensor {
 impl Device {
     fn qzeros(&self, elem_count: usize, dtype: GgmlDType) -> Result<QStorage> {
         match self {
-            Device::Cpu => {
-                let storage = dtype.cpu_zeros(elem_count);
-                Ok(QStorage::Cpu(storage))
-            }
+            Device::Cpu => Ok(dtype.cpu_zeros(elem_count)),
             Device::Metal(metal) => {
                 let storage = metal::QMetalStorage::zeros(metal, elem_count, dtype)?;
                 Ok(QStorage::Metal(storage))
@@ -86,17 +84,84 @@ impl Device {
     }
 }
 
+pub trait RawQuantizedType: Send + Sync {
+    fn dtype(&self) -> GgmlDType;
+    fn block_size(&self) -> usize;
+    fn data(&self) -> &[u8];
+}
+
+struct RawBlockStorage<T> {
+    blocks: Vec<T>,
+    dtype: GgmlDType,
+    block_size: usize,
+}
+
+impl<T> RawQuantizedType for RawBlockStorage<T>
+where
+    T: IntoBytes + Immutable + Send + Sync,
+{
+    fn dtype(&self) -> GgmlDType {
+        self.dtype
+    }
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+
+    fn data(&self) -> &[u8] {
+        self.blocks.as_bytes()
+    }
+}
+
 pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
+    CpuRaw(Box<dyn RawQuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+}
+
+fn raw_storage_from_data<T>(data: &[u8], dtype: GgmlDType, block_size: usize) -> Result<QStorage>
+where
+    T: FromBytes + IntoBytes + Immutable + Send + Sync + 'static,
+{
+    // Keep raw block bytes unchanged; scalar endian interpretation belongs to later math support.
+    let type_size = std::mem::size_of::<T>();
+    if !data.len().is_multiple_of(type_size) {
+        crate::bail!(
+            "{dtype:?} raw data length {} is not divisible by block byte size {type_size}",
+            data.len()
+        )
+    }
+    let blocks = data
+        .chunks_exact(type_size)
+        .map(|bytes| {
+            T::read_from_bytes(bytes)
+                .map_err(|_| crate::Error::Msg(format!("failed to copy one {dtype:?} raw block")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QStorage::CpuRaw(Box::new(RawBlockStorage {
+        blocks,
+        dtype,
+        block_size,
+    })))
+}
+
+fn raw_zero_storage<T>(block_count: usize, dtype: GgmlDType, block_size: usize) -> QStorage
+where
+    T: FromZeros + IntoBytes + Immutable + Clone + Send + Sync + 'static,
+{
+    QStorage::CpuRaw(Box::new(RawBlockStorage {
+        blocks: vec![T::new_zeroed(); block_count],
+        dtype,
+        block_size,
+    }))
 }
 
 impl QStorage {
     pub fn from_data(data: Cow<'_, [u8]>, device: &Device, dtype: GgmlDType) -> Result<Self> {
         let data: &[u8] = &data;
         match device {
-            Device::Cpu => Ok(Self::Cpu(dtype.from_data(Cow::Borrowed(data)))),
+            Device::Cpu => dtype.from_data(Cow::Borrowed(data)),
             Device::Metal(d) => match dtype {
                 GgmlDType::F32 => metal::load_quantized(d, as_t_slice::<f32>(data)),
                 GgmlDType::F16 => metal::load_quantized(d, as_t_slice::<f16>(data)),
@@ -113,6 +178,9 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::Q8H1 | GgmlDType::Q8HP1 => {
+                    crate::bail!("{dtype:?} raw storage is not supported on Metal")
+                }
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -130,6 +198,9 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                GgmlDType::Q8H1 | GgmlDType::Q8HP1 => {
+                    crate::bail!("{dtype:?} raw storage is not supported on CUDA")
+                }
             },
             #[cfg(feature = "aqua")]
             Device::Aqua(_) => crate::bail!("quantized storage is not supported on Aqua devices"),
@@ -139,6 +210,7 @@ impl QStorage {
     fn block_size(&self) -> usize {
         match self {
             QStorage::Cpu(storage) => storage.block_size(),
+            QStorage::CpuRaw(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
         }
@@ -147,6 +219,7 @@ impl QStorage {
     fn dtype(&self) -> GgmlDType {
         match self {
             QStorage::Cpu(storage) => storage.dtype(),
+            QStorage::CpuRaw(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
         }
@@ -154,7 +227,7 @@ impl QStorage {
 
     fn device(&self) -> Device {
         match self {
-            QStorage::Cpu(_storage) => Device::Cpu,
+            QStorage::Cpu(_) | QStorage::CpuRaw(_) => Device::Cpu,
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
         }
@@ -163,6 +236,7 @@ impl QStorage {
     fn size_in_bytes(&self) -> usize {
         match self {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
+            QStorage::CpuRaw(storage) => storage.data().len(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
         }
@@ -237,6 +311,12 @@ impl QStorage {
     fn dequantize(&self, elem_count: usize) -> Result<Storage> {
         match self {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
+            QStorage::CpuRaw(storage) => {
+                crate::bail!(
+                    "dequantization is not implemented for {:?}",
+                    storage.dtype()
+                )
+            }
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
         }
@@ -250,6 +330,7 @@ impl QStorage {
                 let data = unsafe { std::slice::from_raw_parts(data_ptr, size_in_bytes) };
                 Ok(Cow::from(data))
             }
+            QStorage::CpuRaw(storage) => Ok(Cow::Borrowed(storage.data())),
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
         }
@@ -258,7 +339,7 @@ impl QStorage {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::CpuRaw(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -274,7 +355,7 @@ impl QStorage {
     )> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr_with_guard(stream),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::CpuRaw(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -283,10 +364,6 @@ impl QStorage {
 
 /// Logical element count for Q8_H GGUF blocks.
 pub const QK8_H: usize = 32;
-
-// GGUF ABI block storage byte sizes, not Rust struct sizes.
-pub const Q8_H1_TYPE_SIZE: usize = 44;
-pub const Q8_HP1_TYPE_SIZE: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlDType {
@@ -360,8 +437,8 @@ impl GgmlDType {
     }
 
     /// The block dtype
-    pub fn cpu_zeros(&self, elem_count: usize) -> Box<dyn QuantizedType> {
-        match self {
+    pub fn cpu_zeros(&self, elem_count: usize) -> QStorage {
+        let storage: Box<dyn QuantizedType> = match self {
             Self::F32 => Box::new(vec![f32::zeros(); elem_count]),
             Self::F16 => Box::new(vec![f16::zeros(); elem_count]),
             Self::Q4_0 => Box::new(vec![BlockQ4_0::zeros(); elem_count / BlockQ4_0::BLCK_SIZE]),
@@ -377,12 +454,15 @@ impl GgmlDType {
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
-        }
+            Self::Q8H1 => return raw_zero_storage::<BlockQ8H1>(elem_count / QK8_H, *self, QK8_H),
+            Self::Q8HP1 => return raw_zero_storage::<BlockQ8HP1>(elem_count / QK8_H, *self, QK8_H),
+        };
+        QStorage::Cpu(storage)
     }
 
-    pub fn from_data(&self, data: Cow<'_, [u8]>) -> Box<dyn QuantizedType> {
+    pub fn from_data(&self, data: Cow<'_, [u8]>) -> Result<QStorage> {
         let data: &[u8] = &data;
-        match self {
+        let storage: Box<dyn QuantizedType> = match self {
             Self::F32 => Box::new(as_t_slice::<f32>(data).to_vec()),
             Self::F16 => Box::new(as_t_slice::<f16>(data).to_vec()),
             Self::Q4_0 => Box::new(as_t_slice::<BlockQ4_0>(data).to_vec()),
@@ -398,7 +478,10 @@ impl GgmlDType {
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
-        }
+            Self::Q8H1 => return raw_storage_from_data::<BlockQ8H1>(data, *self, QK8_H),
+            Self::Q8HP1 => return raw_storage_from_data::<BlockQ8HP1>(data, *self, QK8_H),
+        };
+        Ok(QStorage::Cpu(storage))
     }
 
     /// The type size for blocks in bytes.
@@ -420,8 +503,8 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
-            Self::Q8H1 => Q8_H1_TYPE_SIZE,
-            Self::Q8HP1 => Q8_HP1_TYPE_SIZE,
+            Self::Q8H1 => std::mem::size_of::<BlockQ8H1>(),
+            Self::Q8HP1 => std::mem::size_of::<BlockQ8HP1>(),
         }
     }
 
@@ -445,6 +528,30 @@ impl GgmlDType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn q8_h1_fixture() -> [u8; 44] {
+        let mut bytes = [0u8; 44];
+        for (index, byte) in bytes[..32].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        bytes[32] = 0x7d;
+        bytes[33..36].copy_from_slice(&[0xa1, 0xb2, 0xc3]);
+        bytes[36..40].copy_from_slice(&f32::from_bits(0x3eaaaaab).to_ne_bytes());
+        bytes[40..42].copy_from_slice(&0xbeefu16.to_ne_bytes());
+        bytes[42..44].copy_from_slice(&[0xd4, 0xe5]);
+        bytes
+    }
+
+    fn q8_hp1_fixture() -> [u8; 40] {
+        let mut bytes = [0u8; 40];
+        for (index, byte) in bytes[..32].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(29).wrapping_add(11);
+        }
+        bytes[32..34].copy_from_slice(&(-1234i16).to_ne_bytes());
+        bytes[34..36].copy_from_slice(&[0xc7, 0xd8]);
+        bytes[36..40].copy_from_slice(&f32::from_bits(0x3f123456).to_ne_bytes());
+        bytes
+    }
 
     #[test]
     fn q8_h1_dtype_id_round_trip() -> Result<()> {
@@ -476,6 +583,71 @@ mod tests {
     fn unsupported_q8_h_custom_ids() {
         assert!(GgmlDType::from_u32(40).is_err());
         assert!(GgmlDType::from_u32(42).is_err());
+    }
+
+    #[test]
+    fn q8_h1_layout_matches_gguf_abi() {
+        assert_eq!(std::mem::size_of::<BlockQ8H1>(), 44);
+        assert_eq!(std::mem::align_of::<BlockQ8H1>(), 4);
+        assert_eq!(std::mem::offset_of!(BlockQ8H1, qs), 0);
+        assert_eq!(std::mem::offset_of!(BlockQ8H1, c_b), 32);
+        assert_eq!(std::mem::offset_of!(BlockQ8H1, s_rf), 36);
+        assert_eq!(std::mem::offset_of!(BlockQ8H1, r), 40);
+    }
+
+    #[test]
+    fn q8_hp1_layout_matches_gguf_abi() {
+        assert_eq!(std::mem::size_of::<BlockQ8HP1>(), 40);
+        assert_eq!(std::mem::align_of::<BlockQ8HP1>(), 4);
+        assert_eq!(std::mem::offset_of!(BlockQ8HP1, qs), 0);
+        assert_eq!(std::mem::offset_of!(BlockQ8HP1, m), 32);
+        assert_eq!(std::mem::offset_of!(BlockQ8HP1, padding), 34);
+        assert_eq!(std::mem::offset_of!(BlockQ8HP1, channel_scale), 36);
+    }
+
+    #[test]
+    fn q8_h1_cpu_from_data_preserves_bytes() -> Result<()> {
+        let bytes = q8_h1_fixture();
+        let mut unaligned = vec![0xff];
+        unaligned.extend_from_slice(&bytes);
+        let raw = &unaligned[1..];
+        assert_ne!(raw.as_ptr() as usize % std::mem::align_of::<BlockQ8H1>(), 0);
+        let storage = QStorage::from_data(Cow::Borrowed(raw), &Device::Cpu, GgmlDType::Q8H1)?;
+        let tensor = QTensor::new(storage, (QK8_H,))?;
+        assert_eq!(tensor.dtype(), GgmlDType::Q8H1);
+        assert_eq!(tensor.storage_size_in_bytes(), bytes.len());
+        assert_eq!(tensor.data()?.as_ref(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_cpu_from_data_preserves_bytes() -> Result<()> {
+        let bytes = q8_hp1_fixture();
+        let storage =
+            QStorage::from_data(Cow::Owned(bytes.to_vec()), &Device::Cpu, GgmlDType::Q8HP1)?;
+        let tensor = QTensor::new(storage, (QK8_H,))?;
+        assert_eq!(tensor.dtype(), GgmlDType::Q8HP1);
+        assert_eq!(tensor.storage_size_in_bytes(), bytes.len());
+        assert_eq!(tensor.data()?.as_ref(), bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h1_cpu_zero_storage_geometry() -> Result<()> {
+        let storage = Device::Cpu.qzeros(2 * QK8_H, GgmlDType::Q8H1)?;
+        let tensor = QTensor::new(storage, (2 * QK8_H,))?;
+        assert_eq!(tensor.storage_size_in_bytes(), 2 * 44);
+        assert_eq!(tensor.data()?.as_ref(), [0u8; 88]);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_cpu_zero_storage_geometry() -> Result<()> {
+        let storage = Device::Cpu.qzeros(2 * QK8_H, GgmlDType::Q8HP1)?;
+        let tensor = QTensor::new(storage, (2 * QK8_H,))?;
+        assert_eq!(tensor.storage_size_in_bytes(), 2 * 40);
+        assert_eq!(tensor.data()?.as_ref(), [0u8; 80]);
+        Ok(())
     }
 }
 
@@ -788,6 +960,9 @@ impl QTensor {
                 let ids = ids.to_vec1::<u32>()?;
                 Storage::Cpu(storage.embedding(&ids, rows, hidden)?)
             }
+            QStorage::CpuRaw(storage) => {
+                crate::bail!("embedding is not implemented for {:?}", storage.dtype())
+            }
             QStorage::Metal(storage) => match &*ids.storage() {
                 Storage::Metal(ids_storage) => {
                     Storage::Metal(storage.embedding(rows, hidden, ids_storage, ids.layout())?)
@@ -844,7 +1019,7 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
-            QStorage::Metal(_) | QStorage::Cpu(_) => {
+            QStorage::Metal(_) | QStorage::Cpu(_) | QStorage::CpuRaw(_) => {
                 crate::bail!("not implemented");
             }
         }
@@ -983,6 +1158,9 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
+            QStorage::CpuRaw(storage) => {
+                crate::bail!("matmul is not implemented for {:?}", storage.dtype())
+            }
             QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
         };
         match storage.dtype() {
