@@ -281,6 +281,13 @@ impl QStorage {
     }
 }
 
+/// Logical element count for Q8_H GGUF blocks.
+pub const QK8_H: usize = 32;
+
+// GGUF ABI block storage byte sizes, not Rust struct sizes.
+pub const Q8_H1_TYPE_SIZE: usize = 44;
+pub const Q8_HP1_TYPE_SIZE: usize = 40;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GgmlDType {
     F32,
@@ -298,6 +305,8 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    Q8H1,
+    Q8HP1,
 }
 
 impl GgmlDType {
@@ -319,6 +328,9 @@ impl GgmlDType {
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            // https://github.com/ajou-aisa/llama.cpp-gemmini/blob/d5e76be1fca91314c5a0745038b3cedbbdbed13d/ggml/include/ggml.h#L391-L393
+            39 => Self::Q8H1,
+            41 => Self::Q8HP1,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -342,6 +354,8 @@ impl GgmlDType {
             Self::Q8K => 15,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::Q8H1 => 39,
+            Self::Q8HP1 => 41,
         }
     }
 
@@ -406,6 +420,8 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::Q8H1 => Q8_H1_TYPE_SIZE,
+            Self::Q8HP1 => Q8_HP1_TYPE_SIZE,
         }
     }
 
@@ -420,8 +436,46 @@ impl GgmlDType {
             Self::Q5_1 => k_quants::QK5_1,
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
+            Self::Q8H1 | Self::Q8HP1 => QK8_H,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q8_h1_dtype_id_round_trip() -> Result<()> {
+        assert_eq!(GgmlDType::from_u32(39)?, GgmlDType::Q8H1);
+        assert_eq!(GgmlDType::Q8H1.to_u32(), 39);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_dtype_id_round_trip() -> Result<()> {
+        assert_eq!(GgmlDType::from_u32(41)?, GgmlDType::Q8HP1);
+        assert_eq!(GgmlDType::Q8HP1.to_u32(), 41);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h1_block_geometry() {
+        assert_eq!(GgmlDType::Q8H1.block_size(), 32);
+        assert_eq!(GgmlDType::Q8H1.type_size(), 44);
+    }
+
+    #[test]
+    fn q8_hp1_block_geometry() {
+        assert_eq!(GgmlDType::Q8HP1.block_size(), 32);
+        assert_eq!(GgmlDType::Q8HP1.type_size(), 40);
+    }
+
+    #[test]
+    fn unsupported_q8_h_custom_ids() {
+        assert!(GgmlDType::from_u32(40).is_err());
+        assert!(GgmlDType::from_u32(42).is_err());
     }
 }
 
