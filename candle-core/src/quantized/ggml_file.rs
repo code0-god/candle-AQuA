@@ -186,6 +186,11 @@ pub fn qtensor_from_ggml(
         GgmlDType::Q6K => {
             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
         }
+        GgmlDType::Q8H1 | GgmlDType::Q8HP1 => {
+            let storage =
+                QStorage::from_data(std::borrow::Cow::Borrowed(raw_data), device, ggml_dtype)?;
+            super::QTensor::new(storage, dims)
+        }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }
 }

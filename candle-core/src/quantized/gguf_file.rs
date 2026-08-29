@@ -592,8 +592,42 @@ pub fn write<W: std::io::Seek + std::io::Write>(
     metadata: &[(&str, &Value)],
     tensors: &[(&str, &QTensor)],
 ) -> Result<()> {
+    write_with_version(w, VersionedMagic::GgufV2, metadata, tensors)
+}
+
+pub fn write_with_version<W: std::io::Seek + std::io::Write>(
+    w: &mut W,
+    version: VersionedMagic,
+    metadata: &[(&str, &Value)],
+    tensors: &[(&str, &QTensor)],
+) -> Result<()> {
+    let version = match version {
+        VersionedMagic::GgufV2 => 2,
+        VersionedMagic::GgufV3 => 3,
+        VersionedMagic::GgufV1 => crate::bail!("GGUF V1 writing is not supported"),
+    };
+    let alignment = metadata
+        .iter()
+        .find_map(|(key, value)| {
+            if *key != "general.alignment" {
+                return None;
+            }
+            match value {
+                Value::U8(value) => Some(*value as usize),
+                Value::U16(value) => Some(*value as usize),
+                Value::U32(value) => Some(*value as usize),
+                Value::I8(value) if *value >= 0 => Some(*value as usize),
+                Value::I16(value) if *value >= 0 => Some(*value as usize),
+                Value::I32(value) if *value >= 0 => Some(*value as usize),
+                _ => None,
+            }
+        })
+        .unwrap_or(DEFAULT_ALIGNMENT as usize);
+    if alignment == 0 {
+        crate::bail!("GGUF alignment cannot be zero")
+    }
     w.write_u32::<LittleEndian>(0x46554747)?;
-    w.write_u32::<LittleEndian>(2)?; // version 2.
+    w.write_u32::<LittleEndian>(version)?;
     w.write_u64::<LittleEndian>(tensors.len() as u64)?;
     w.write_u64::<LittleEndian>(metadata.len() as u64)?;
     for (name, value) in metadata.iter() {
@@ -614,11 +648,11 @@ pub fn write<W: std::io::Seek + std::io::Write>(
         w.write_u64::<LittleEndian>(offset as u64)?;
         offsets.push(offset);
         let size_in_bytes = tensor.storage_size_in_bytes();
-        let padding = 31 - (31 + size_in_bytes) % 32;
+        let padding = (alignment - size_in_bytes % alignment) % alignment;
         offset += size_in_bytes + padding;
     }
     let pos = w.stream_position()? as usize;
-    let padding = 31 - (31 + pos) % 32;
+    let padding = (alignment - pos % alignment) % alignment;
     w.write_all(&vec![0u8; padding])?;
     let tensor_start_pos = w.stream_position()? as usize;
     for (offset, (_name, tensor)) in offsets.iter().zip(tensors.iter()) {
@@ -631,7 +665,7 @@ pub fn write<W: std::io::Seek + std::io::Write>(
         let data = tensor.data()?;
         let size_in_bytes = data.len();
         w.write_all(&data)?;
-        let padding = 31 - (31 + size_in_bytes) % 32;
+        let padding = (alignment - size_in_bytes % alignment) % alignment;
         w.write_all(&vec![0u8; padding])?;
     }
     Ok(())
