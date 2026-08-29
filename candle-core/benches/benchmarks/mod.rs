@@ -40,6 +40,11 @@ impl BenchDevice for Device {
                 #[cfg(not(feature = "metal"))]
                 panic!("Metal device without metal feature enabled: {device:?}")
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                use candle_core::backend::BackendDevice;
+                device.synchronize()
+            }
         }
     }
 
@@ -57,6 +62,8 @@ impl BenchDevice for Device {
             }
             Device::Cuda(_) => format!("cuda_{}", name.into()),
             Device::Metal(_) => format!("metal_{}", name.into()),
+            #[cfg(feature = "aqua")]
+            Device::Aqua(_) => format!("aqua_{}", name.into()),
         }
     }
 }

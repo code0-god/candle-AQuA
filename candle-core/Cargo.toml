@@ -47,6 +47,9 @@ criterion = { workspace = true }
 
 [features]
 default = []
+
+aqua = []
+
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]

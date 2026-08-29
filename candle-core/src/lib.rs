@@ -49,6 +49,8 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+#[cfg(feature = "aqua")]
+pub mod aqua_backend;
 pub mod backend;
 pub mod backprop;
 pub mod conv;
@@ -123,6 +125,11 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "aqua")]
+pub use aqua_backend::{
+    AquaDevice, AquaDispatch, AquaExecutor, AquaMatMulRequest, AquaStorage, CpuFallbackAquaExecutor,
+};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;

@@ -676,6 +676,8 @@ impl Tensor {
             Storage::Cpu(cpu_storage) => from_cpu_storage(cpu_storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "aqua")]
+            Storage::Aqua(storage) => from_cpu_storage(storage.cpu_storage()),
         }
     }
 
@@ -1974,6 +1976,8 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "aqua")]
+            Storage::Aqua(storage) => from_cpu_storage(storage.cpu_storage()),
         }
     }
 
@@ -2005,6 +2009,8 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "aqua")]
+            Storage::Aqua(storage) => from_cpu_storage(storage.cpu_storage()),
         }
     }
 
@@ -2046,6 +2052,8 @@ impl Tensor {
             Storage::Cpu(storage) => from_cpu_storage(storage),
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
+            #[cfg(feature = "aqua")]
+            Storage::Aqua(storage) => from_cpu_storage(storage.cpu_storage()),
         }
     }
 
@@ -2402,14 +2410,40 @@ impl Tensor {
                 (Storage::Cpu(storage), Device::Metal(metal)) => {
                     Storage::Metal(metal.storage_from_cpu_storage(storage)?)
                 }
+                #[cfg(feature = "aqua")]
+                (Storage::Cpu(storage), Device::Aqua(aqua)) => {
+                    Storage::Aqua(aqua.storage_from_cpu_storage(storage)?)
+                }
                 (Storage::Cuda(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Metal(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                #[cfg(feature = "aqua")]
+                (Storage::Aqua(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Cuda(storage), Device::Cuda(cuda)) => {
                     // can't clone storage if it's the same device because of the underlying device ptr
                     let dst_storage = storage.transfer_to_device(cuda)?;
                     Storage::Cuda(dst_storage)
                 }
                 (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
+                #[cfg(feature = "aqua")]
+                (Storage::Cuda(storage), Device::Aqua(aqua)) => {
+                    Storage::Aqua(aqua.storage_from_cpu_storage_owned(storage.to_cpu_storage()?)?)
+                }
+                #[cfg(feature = "aqua")]
+                (Storage::Metal(storage), Device::Aqua(aqua)) => {
+                    Storage::Aqua(aqua.storage_from_cpu_storage_owned(storage.to_cpu_storage()?)?)
+                }
+                #[cfg(feature = "aqua")]
+                (Storage::Aqua(storage), Device::Cuda(cuda)) => {
+                    Storage::Cuda(cuda.storage_from_cpu_storage(storage.cpu_storage())?)
+                }
+                #[cfg(feature = "aqua")]
+                (Storage::Aqua(storage), Device::Metal(metal)) => {
+                    Storage::Metal(metal.storage_from_cpu_storage(storage.cpu_storage())?)
+                }
+                #[cfg(feature = "aqua")]
+                (Storage::Aqua(storage), Device::Aqua(aqua)) => {
+                    Storage::Aqua(aqua.storage_from_cpu_storage(storage.cpu_storage())?)
+                }
                 _ => {
                     bail!(
                         "not implemented yet, self.device: {:?}, device: {:?}",

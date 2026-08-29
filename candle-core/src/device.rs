@@ -1,14 +1,27 @@
+#[cfg(feature = "aqua")]
+use crate::aqua_backend::{AquaDevice, AquaExecutor};
 use crate::backend::BackendDevice;
 use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
+
+#[cfg(feature = "aqua")]
+use std::sync::Arc;
 
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
 /// can live on the same location (typically for cuda devices).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceLocation {
     Cpu,
-    Cuda { gpu_id: usize },
-    Metal { gpu_id: usize },
+    Cuda {
+        gpu_id: usize,
+    },
+    Metal {
+        gpu_id: usize,
+    },
+    #[cfg(feature = "aqua")]
+    Aqua {
+        device_id: usize,
+    },
 }
 
 /// Cpu, Cuda, or Metal
@@ -17,6 +30,9 @@ pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),
     Metal(crate::MetalDevice),
+
+    #[cfg(feature = "aqua")]
+    Aqua(AquaDevice),
 }
 
 pub trait NdArray {
@@ -231,6 +247,39 @@ impl<S: WithDType> NdArray for Vec<Vec<Vec<Vec<S>>>> {
 }
 
 impl Device {
+    #[cfg(feature = "aqua")]
+    pub fn new_aqua(device_id: usize) -> Result<Self> {
+        Ok(Self::Aqua(AquaDevice::cpu_fallback(device_id)))
+    }
+
+    #[cfg(feature = "aqua")]
+    pub fn new_aqua_with_executor(
+        device_id: usize,
+        executor: Arc<dyn AquaExecutor>,
+    ) -> Result<Self> {
+        Ok(Self::Aqua(AquaDevice::with_executor(device_id, executor)))
+    }
+
+    #[cfg(feature = "aqua")]
+    pub fn as_aqua_device(&self) -> Result<&AquaDevice> {
+        match self {
+            Self::Aqua(device) => Ok(device),
+            other => crate::bail!("expected an aqua device, got {other:?}"),
+        }
+    }
+
+    pub fn is_aqua(&self) -> bool {
+        #[cfg(feature = "aqua")]
+        {
+            matches!(self, Self::Aqua(_))
+        }
+
+        #[cfg(not(feature = "aqua"))]
+        {
+            false
+        }
+    }
+
     pub fn new_cuda(ordinal: usize) -> Result<Self> {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
@@ -239,6 +288,8 @@ impl Device {
         match self {
             Self::Cuda(d) => Ok(d),
             Self::Cpu => crate::bail!("expected a cuda device, got cpu"),
+            #[cfg(feature = "aqua")]
+            Self::Aqua(_) => crate::bail!("expected a cuda device, got aqua"),
             Self::Metal(_) => crate::bail!("expected a cuda device, got Metal"),
         }
     }
@@ -247,6 +298,8 @@ impl Device {
         match self {
             Self::Cuda(_) => crate::bail!("expected a metal device, got cuda"),
             Self::Cpu => crate::bail!("expected a metal device, got cpu"),
+            #[cfg(feature = "aqua")]
+            Self::Aqua(_) => crate::bail!("expected a metal device, got aqua"),
             Self::Metal(d) => Ok(d),
         }
     }
@@ -261,9 +314,10 @@ impl Device {
 
     /// Run `f` with device specific context.
     ///
-    /// On CPU this installs candle's private rayon thread pool for the
-    /// duration of `f`, keeping worker threads warm across the many short
-    /// parallel sections in a model forward pass. Currently noop for other backends.
+    /// On CPU and CPU-shadow Aqua this installs candle's private rayon thread
+    /// pool for the duration of `f`, keeping worker threads warm across the
+    /// many short parallel sections in a model forward pass. Currently noop
+    /// for CUDA and Metal.
     pub fn with_context<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R + Send,
@@ -271,6 +325,8 @@ impl Device {
     {
         match self {
             Self::Cpu => crate::utils::with_threadpool(f),
+            #[cfg(feature = "aqua")]
+            Self::Aqua(_) => crate::utils::with_threadpool(f),
             _ => f(),
         }
     }
@@ -280,6 +336,8 @@ impl Device {
             Self::Cpu => CpuDevice.set_seed(seed),
             Self::Cuda(c) => c.set_seed(seed),
             Self::Metal(m) => m.set_seed(seed),
+            #[cfg(feature = "aqua")]
+            Self::Aqua(a) => a.set_seed(seed),
         }
     }
 
@@ -288,6 +346,8 @@ impl Device {
             Self::Cpu => CpuDevice.get_current_seed(),
             Self::Cuda(c) => c.get_current_seed(),
             Self::Metal(m) => m.get_current_seed(),
+            #[cfg(feature = "aqua")]
+            Self::Aqua(a) => a.get_current_seed(),
         }
     }
 
@@ -296,6 +356,8 @@ impl Device {
             (Self::Cpu, Self::Cpu) => true,
             (Self::Cuda(lhs), Self::Cuda(rhs)) => lhs.same_device(rhs),
             (Self::Metal(lhs), Self::Metal(rhs)) => lhs.same_device(rhs),
+            #[cfg(feature = "aqua")]
+            (Self::Aqua(lhs), Self::Aqua(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -305,6 +367,8 @@ impl Device {
             Self::Cpu => DeviceLocation::Cpu,
             Self::Cuda(device) => device.location(),
             Device::Metal(device) => device.location(),
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => device.location(),
         }
     }
 
@@ -323,6 +387,8 @@ impl Device {
     pub fn supports_bf16(&self) -> bool {
         match self {
             Self::Cuda(_) | Self::Metal(_) => true,
+            #[cfg(feature = "aqua")]
+            Self::Aqua(_) => false,
             Self::Cpu => false,
         }
     }
@@ -378,6 +444,11 @@ impl Device {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Aqua(storage))
+            }
         }
     }
 
@@ -416,6 +487,11 @@ impl Device {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Aqua(storage))
+            }
         }
     }
 
@@ -442,6 +518,11 @@ impl Device {
                 let storage = device.zeros_impl(shape, dtype)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::Aqua(storage))
+            }
         }
     }
 
@@ -459,6 +540,11 @@ impl Device {
                 let storage = device.alloc_uninit(shape, dtype)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::Aqua(storage))
+            }
         }
     }
 
@@ -472,6 +558,11 @@ impl Device {
             Device::Metal(device) => {
                 let storage = device.storage_from_slice(data)?;
                 Ok(Storage::Metal(storage))
+            }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::Aqua(storage))
             }
         }
     }
@@ -489,6 +580,12 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Aqua(storage))
+            }
         }
     }
 
@@ -505,6 +602,12 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Metal(storage))
             }
+            #[cfg(feature = "aqua")]
+            Device::Aqua(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Aqua(storage))
+            }
         }
     }
 
@@ -513,6 +616,8 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.synchronize(),
             Self::Metal(d) => d.synchronize(),
+            #[cfg(feature = "aqua")]
+            Self::Aqua(d) => d.synchronize(),
         }
     }
 }

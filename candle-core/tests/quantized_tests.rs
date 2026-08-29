@@ -144,6 +144,10 @@ fn quantized_matmul(device: &Device) -> Result<()> {
                 [341876.0, 994283.0, 1655709.0, 2301518.0]
             ]
         ),
+        #[cfg(feature = "aqua")]
+        Device::Aqua(_) => {
+            unreachable!("quantized Aqua storage is rejected before result comparison")
+        }
     }
     test_matmul(device, (1, 3, 4, 256), GgmlDType::Q4_0)?;
     Ok(())
@@ -208,6 +212,10 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
                 [-196472.0, 63012.0, 324585.0, 587902.0]
             ]
         ),
+        #[cfg(feature = "aqua")]
+        Device::Aqua(_) => {
+            unreachable!("quantized Aqua storage is rejected before result comparison")
+        }
     }
     let lhs2 = Tensor::stack(&[&lhs, &lhs], 0)?;
     let res2 = matmul.forward(&lhs2)?;
