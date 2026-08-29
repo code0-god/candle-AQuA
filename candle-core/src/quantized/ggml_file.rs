@@ -5,6 +5,10 @@ use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
 
+mod dtype;
+
+use dtype::decode_ggml_dtype;
+
 // https://github.com/ggerganov/llama.cpp/blob/468ea24fb4633a0d681f7ac84089566c1c6190cb/llama.h#L37
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Magic {
@@ -203,7 +207,7 @@ fn read_one_tensor<R: std::io::Seek + std::io::Read>(
     let n_dims = reader.read_u32::<LittleEndian>()?;
     let name_len = reader.read_u32::<LittleEndian>()?;
     let ggml_dtype = reader.read_u32::<LittleEndian>()?;
-    let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
+    let ggml_dtype = decode_ggml_dtype(ggml_dtype)?;
     let mut dims = vec![0u32; n_dims as usize];
     reader.read_u32_into::<LittleEndian>(&mut dims)?;
     // The dimensions are stored in reverse order, see for example:
@@ -271,3 +275,6 @@ impl Content {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

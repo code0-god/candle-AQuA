@@ -408,9 +408,6 @@ impl GgmlDType {
             15 => Self::Q8K,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
-            // https://github.com/ajou-aisa/llama.cpp-gemmini/blob/d5e76be1fca91314c5a0745038b3cedbbdbed13d/ggml/include/ggml.h#L391-L393
-            39 => Self::Q8H1,
-            41 => Self::Q8HP1,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -567,17 +564,15 @@ mod tests {
     }
 
     #[test]
-    fn q8_h1_dtype_id_round_trip() -> Result<()> {
-        assert_eq!(GgmlDType::from_u32(39)?, GgmlDType::Q8H1);
+    fn q8_h1_dtype_id_requires_profile_decode() {
+        assert!(GgmlDType::from_u32(39).is_err());
         assert_eq!(GgmlDType::Q8H1.to_u32(), 39);
-        Ok(())
     }
 
     #[test]
-    fn q8_hp1_dtype_id_round_trip() -> Result<()> {
-        assert_eq!(GgmlDType::from_u32(41)?, GgmlDType::Q8HP1);
+    fn q8_hp1_dtype_id_requires_profile_decode() {
+        assert!(GgmlDType::from_u32(41).is_err());
         assert_eq!(GgmlDType::Q8HP1.to_u32(), 41);
-        Ok(())
     }
 
     #[test]

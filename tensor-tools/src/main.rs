@@ -12,6 +12,9 @@ const GGML_QNT_VERSION: u32 = 2;
 // commit d5e76be1fca91314c5a0745038b3cedbbdbed13d
 const LLAMA_FTYPE_MOSTLY_Q8_H1: u32 = 38;
 const LLAMA_FTYPE_MOSTLY_Q8_HP1: u32 = 40;
+const AQUA_GGUF_PROFILE_KEY: &str = "aqua.gguf.profile";
+const AQUA_GGUF_PROFILE_VERSION_KEY: &str = "aqua.gguf.profile_version";
+const AQUA_GGUF_PROFILE_VERSION: u32 = 1;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum QuantizationMode {
@@ -104,6 +107,14 @@ impl Quantization {
         match self {
             Self::Q8H1 => Some(LLAMA_FTYPE_MOSTLY_Q8_H1),
             Self::Q8HP1 => Some(LLAMA_FTYPE_MOSTLY_Q8_HP1),
+            _ => None,
+        }
+    }
+
+    fn profile_name(self) -> Option<&'static str> {
+        match self {
+            Self::Q8H1 => Some("q8_h1"),
+            Self::Q8HP1 => Some("q8_hp1"),
             _ => None,
         }
     }
@@ -665,6 +676,11 @@ fn run_quantize_aqua_gguf(
             "Aqua mode requires q8_h1 or q8_hp1, got {quantization:?}"
         ))
     })?;
+    let profile_name = quantization.profile_name().ok_or_else(|| {
+        candle::Error::Msg(format!(
+            "Aqua mode requires q8_h1 or q8_hp1, got {quantization:?}"
+        ))
+    })?;
     if input_path.extension().and_then(|value| value.to_str()) != Some("gguf") {
         candle::bail!("Q8_H conversion requires a single GGUF input")
     }
@@ -700,6 +716,14 @@ fn run_quantize_aqua_gguf(
         let info = content.tensor_infos.get(&name).unwrap();
         let action = classify_aqua_quantization(&name, &info.shape);
         let source_dtype = info.ggml_dtype;
+        if matches!(source_dtype, GgmlDType::Q8H1 | GgmlDType::Q8HP1)
+            && source_dtype != target_dtype
+        {
+            candle::bail!(
+                "{target_dtype:?} conversion rejects opposite H-family dtype \
+                 {source_dtype:?} in tensor {name}"
+            )
+        }
         let shape = info.shape.clone();
         let tensor = content.tensor(&mut input_file, &name, device)?;
         let tensor = match action {
@@ -775,6 +799,14 @@ fn run_quantize_aqua_gguf(
     metadata.insert(
         "general.file_type".to_string(),
         gguf_file::Value::U32(file_type),
+    );
+    metadata.insert(
+        AQUA_GGUF_PROFILE_KEY.to_owned(),
+        gguf_file::Value::String(profile_name.to_owned()),
+    );
+    metadata.insert(
+        AQUA_GGUF_PROFILE_VERSION_KEY.to_owned(),
+        gguf_file::Value::U32(AQUA_GGUF_PROFILE_VERSION),
     );
     let mut metadata = metadata.into_iter().collect::<Vec<_>>();
     metadata.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1164,6 +1196,14 @@ mod tests {
                 Some(gguf_file::Value::U32(GGML_QNT_VERSION))
             ));
             assert!(matches!(
+                output.metadata.get("aqua.gguf.profile"),
+                Some(gguf_file::Value::String(value)) if value == "q8_hp1"
+            ));
+            assert!(matches!(
+                output.metadata.get("aqua.gguf.profile_version"),
+                Some(gguf_file::Value::U32(1))
+            ));
+            assert!(matches!(
                 output.metadata.get("custom.tensor-tools.test"),
                 Some(gguf_file::Value::String(value)) if value == "preserve-me"
             ));
@@ -1205,6 +1245,14 @@ mod tests {
             assert!(matches!(
                 h1.metadata.get("general.file_type"),
                 Some(gguf_file::Value::U32(LLAMA_FTYPE_MOSTLY_Q8_H1))
+            ));
+            assert!(matches!(
+                h1.metadata.get("aqua.gguf.profile"),
+                Some(gguf_file::Value::String(value)) if value == "q8_h1"
+            ));
+            assert!(matches!(
+                h1.metadata.get("aqua.gguf.profile_version"),
+                Some(gguf_file::Value::U32(1))
             ));
             assert_eq!(
                 h1.tensor_infos
@@ -1302,11 +1350,52 @@ mod tests {
         let target = qtensor(vec![8.0; 64 * 64], (64, 64), GgmlDType::Q8HP1)?;
         let expected = target.data()?.into_owned();
         let mut file = std::fs::File::create(&input)?;
-        gguf_file::write(&mut file, &[], &[("output.weight", &target)])?;
+        let profile = gguf_file::Value::String("q8_hp1".to_owned());
+        let profile_version = gguf_file::Value::U32(AQUA_GGUF_PROFILE_VERSION);
+        let quantization_version = gguf_file::Value::U32(GGML_QNT_VERSION);
+        let file_type = gguf_file::Value::U32(LLAMA_FTYPE_MOSTLY_Q8_HP1);
+        let metadata = [
+            (AQUA_GGUF_PROFILE_KEY, &profile),
+            (AQUA_GGUF_PROFILE_VERSION_KEY, &profile_version),
+            ("general.quantization_version", &quantization_version),
+            ("general.file_type", &file_type),
+        ];
+        gguf_file::write(&mut file, &metadata, &[("output.weight", &target)])?;
         drop(file);
 
         run_quantize_aqua_gguf(&input, &output, Quantization::Q8HP1, &Device::Cpu)?;
         assert_eq!(tensor_bytes(&output, "output.weight")?, expected);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn aqua_conversion_rejects_copy_classified_opposite_h_dtype() -> Result<()> {
+        // Given
+        let dir = temp_dir("opposite-h-dtype");
+        let input = dir.join("input.gguf");
+        let output = dir.join("output.gguf");
+        let source = qtensor(vec![8.0; 64 * 64], (64, 64), GgmlDType::Q8HP1)?;
+        let profile = gguf_file::Value::String("q8_hp1".to_owned());
+        let profile_version = gguf_file::Value::U32(AQUA_GGUF_PROFILE_VERSION);
+        let quantization_version = gguf_file::Value::U32(GGML_QNT_VERSION);
+        let file_type = gguf_file::Value::U32(LLAMA_FTYPE_MOSTLY_Q8_HP1);
+        let metadata = [
+            (AQUA_GGUF_PROFILE_KEY, &profile),
+            (AQUA_GGUF_PROFILE_VERSION_KEY, &profile_version),
+            ("general.quantization_version", &quantization_version),
+            ("general.file_type", &file_type),
+        ];
+        let mut file = std::fs::File::create(&input)?;
+        gguf_file::write(&mut file, &metadata, &[("position_embd.weight", &source)])?;
+        drop(file);
+
+        // When
+        let result = run_quantize_aqua_gguf(&input, &output, Quantization::Q8H1, &Device::Cpu);
+
+        // Then
+        assert!(result.is_err());
+        assert!(!output.exists());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

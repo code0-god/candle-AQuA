@@ -7,6 +7,11 @@ use crate::{Context, Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::collections::HashMap;
 
+mod profile;
+
+pub use profile::GgufTypeProfile;
+use profile::{decode_gguf_dtype, detect_type_profile, RawTensorInfo};
+
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
 // Caps mirror ggml-org/llama.cpp#19856 (GGUF_MAX_STRING_LENGTH,
@@ -122,6 +127,7 @@ impl TensorInfo {
 #[derive(Debug)]
 pub struct Content {
     pub magic: VersionedMagic,
+    pub profile: GgufTypeProfile,
     pub metadata: HashMap<String, Value>,
     pub tensor_infos: HashMap<String, TensorInfo>,
     pub tensor_data_offset: u64,
@@ -511,7 +517,7 @@ impl Content {
             let value = Value::read(reader, value_type, &magic, 0, file_size)?;
             metadata.insert(key, value);
         }
-        let mut tensor_infos = HashMap::new();
+        let mut raw_tensor_infos = HashMap::new();
         for _idx in 0..tensor_count {
             let tensor_name = read_string(reader, &magic, file_size)?;
             let n_dimensions = reader.read_u32::<LittleEndian>()?;
@@ -535,18 +541,32 @@ impl Content {
             };
 
             dimensions.reverse();
-            let ggml_dtype = reader.read_u32::<LittleEndian>()?;
-            let ggml_dtype = GgmlDType::from_u32(ggml_dtype)?;
+            let raw_dtype = reader.read_u32::<LittleEndian>()?;
             let offset = reader.read_u64::<LittleEndian>()?;
-            tensor_infos.insert(
+            raw_tensor_infos.insert(
                 tensor_name,
-                TensorInfo {
+                RawTensorInfo {
                     shape: crate::Shape::from(dimensions),
                     offset,
-                    ggml_dtype,
+                    raw_dtype,
                 },
             );
         }
+        let profile = detect_type_profile(&metadata, &raw_tensor_infos)?;
+        let tensor_infos = raw_tensor_infos
+            .into_iter()
+            .map(|(name, raw)| {
+                let ggml_dtype = decode_gguf_dtype(raw.raw_dtype, profile)?;
+                Ok((
+                    name,
+                    TensorInfo {
+                        shape: raw.shape,
+                        offset: raw.offset,
+                        ggml_dtype,
+                    },
+                ))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
         let position = reader.stream_position()?;
         let alignment = match metadata.get("general.alignment") {
             Some(Value::U8(v)) => *v as u64,
@@ -560,6 +580,7 @@ impl Content {
         let tensor_data_offset = position.div_ceil(alignment) * alignment;
         Ok(Self {
             magic,
+            profile,
             metadata,
             tensor_infos,
             tensor_data_offset,
