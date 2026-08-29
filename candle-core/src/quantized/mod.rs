@@ -120,6 +120,17 @@ pub enum QStorage {
     Cuda(cuda::QCudaStorage),
 }
 
+fn raw_storage_from_blocks<T>(blocks: Vec<T>, dtype: GgmlDType, block_size: usize) -> QStorage
+where
+    T: IntoBytes + Immutable + Send + Sync + 'static,
+{
+    QStorage::CpuRaw(Box::new(RawBlockStorage {
+        blocks,
+        dtype,
+        block_size,
+    }))
+}
+
 fn raw_storage_from_data<T>(data: &[u8], dtype: GgmlDType, block_size: usize) -> Result<QStorage>
 where
     T: FromBytes + IntoBytes + Immutable + Send + Sync + 'static,
@@ -139,22 +150,14 @@ where
                 .map_err(|_| crate::Error::Msg(format!("failed to copy one {dtype:?} raw block")))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(QStorage::CpuRaw(Box::new(RawBlockStorage {
-        blocks,
-        dtype,
-        block_size,
-    })))
+    Ok(raw_storage_from_blocks(blocks, dtype, block_size))
 }
 
 fn raw_zero_storage<T>(block_count: usize, dtype: GgmlDType, block_size: usize) -> QStorage
 where
     T: FromZeros + IntoBytes + Immutable + Clone + Send + Sync + 'static,
 {
-    QStorage::CpuRaw(Box::new(RawBlockStorage {
-        blocks: vec![T::new_zeroed(); block_count],
-        dtype,
-        block_size,
-    }))
+    raw_storage_from_blocks(vec![T::new_zeroed(); block_count], dtype, block_size)
 }
 
 impl QStorage {
@@ -553,6 +556,16 @@ mod tests {
         bytes
     }
 
+    fn q8_h_tensor_blocks<T: FromBytes>(tensor: &QTensor) -> Result<Vec<T>> {
+        let data = tensor.data()?;
+        data.chunks_exact(std::mem::size_of::<T>())
+            .map(|bytes| {
+                T::read_from_bytes(bytes)
+                    .map_err(|_| crate::Error::Msg("invalid Q8_H test block size".to_string()))
+            })
+            .collect()
+    }
+
     #[test]
     fn q8_h1_dtype_id_round_trip() -> Result<()> {
         assert_eq!(GgmlDType::from_u32(39)?, GgmlDType::Q8H1);
@@ -647,6 +660,320 @@ mod tests {
         let tensor = QTensor::new(storage, (2 * QK8_H,))?;
         assert_eq!(tensor.storage_size_in_bytes(), 2 * 40);
         assert_eq!(tensor.data()?.as_ref(), [0u8; 80]);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h_float_helpers_match_c_semantics() {
+        assert_eq!(k_quants::ilogb_positive_f32(1.0), 0);
+        assert_eq!(k_quants::ilogb_positive_f32(2.0), 1);
+        assert_eq!(k_quants::ilogb_positive_f32(0.5), -1);
+        assert_eq!(k_quants::ilogb_positive_f32(f32::MIN_POSITIVE), -126);
+        assert_eq!(k_quants::ilogb_positive_f32(f32::from_bits(1)), -149);
+        assert_eq!(
+            k_quants::ilogb_positive_f32(f32::from_bits(0x007f_ffff)),
+            -127
+        );
+
+        assert_eq!(k_quants::pow2_f32(0), 1.0);
+        assert_eq!(k_quants::pow2_f32(-126), f32::MIN_POSITIVE);
+        assert_eq!(k_quants::pow2_f32(-149).to_bits(), 1);
+        assert_eq!(k_quants::pow2_f32(-150), 0.0);
+        assert_eq!(k_quants::pow2_f32(127).to_bits(), 0x7f00_0000);
+        assert!(k_quants::pow2_f32(128).is_infinite());
+    }
+
+    #[test]
+    fn q8_h_row_shape_validation() {
+        let mut h1 = vec![BlockQ8H1::new_zeroed()];
+        assert!(k_quants::quantize_row_q8_h1_ref(&[], &mut []).is_err());
+        assert!(k_quants::quantize_row_q8_h1_ref(&[0.0; 31], &mut h1).is_err());
+        assert!(k_quants::quantize_row_q8_h1_ref(&[0.0; 32], &mut []).is_err());
+
+        let mut hp1 = vec![BlockQ8HP1::new_zeroed()];
+        assert!(k_quants::quantize_row_q8_hp1_ref(&[], &mut []).is_err());
+        assert!(k_quants::quantize_row_q8_hp1_ref(&[0.0; 31], &mut hp1).is_err());
+        assert!(k_quants::quantize_row_q8_hp1_ref(&[0.0; 32], &mut []).is_err());
+    }
+
+    #[test]
+    fn q8_h1_quantizes_all_zero_row_like_c_reference() -> Result<()> {
+        let mut blocks = vec![BlockQ8H1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_h1_ref(&[0.0; 64], &mut blocks)?;
+        for block in blocks {
+            assert_eq!(block.qs, [0; QK8_H]);
+            assert_eq!(block.c_b, 0);
+            assert_eq!(block._padding, [0; 3]);
+            assert_eq!(block.s_rf, 0.0);
+            assert_eq!(block.r, 0);
+            assert_eq!(block._tail_padding, [0; 2]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h1_quantizes_equal_magnitude_blocks_like_c_reference() -> Result<()> {
+        let mut values = vec![1.0; QK8_H];
+        values.extend(vec![-1.0; QK8_H]);
+        let mut blocks = vec![BlockQ8H1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_h1_ref(&values, &mut blocks)?;
+
+        let expected_scale = f16::from_f32(1.0 / 127.0).to_f32();
+        assert_eq!(blocks[0].qs, [127; QK8_H]);
+        assert_eq!(blocks[1].qs, [-127; QK8_H]);
+        for block in blocks {
+            assert_eq!(block.c_b, 0);
+            assert_eq!(block.s_rf.to_bits(), expected_scale.to_bits());
+            assert_eq!(block.r, 1);
+            assert_eq!(block._padding, [0; 3]);
+            assert_eq!(block._tail_padding, [0; 2]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h1_zero_block_participates_in_scale_range() -> Result<()> {
+        let mut values = vec![0.0; QK8_H];
+        values.extend(vec![1.0; QK8_H]);
+        let mut blocks = vec![BlockQ8H1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_h1_ref(&values, &mut blocks)?;
+
+        let block_scale = f16::from_f32(1.0 / 127.0).to_f32();
+        let expected_row_scale = block_scale / 255.0;
+        assert_eq!(blocks[0].qs, [0; QK8_H]);
+        assert_eq!(blocks[1].qs, [127; QK8_H]);
+        assert_eq!(blocks[0].s_rf.to_bits(), expected_row_scale.to_bits());
+        assert_eq!(blocks[1].s_rf.to_bits(), expected_row_scale.to_bits());
+        assert_eq!(blocks[0].r, 0);
+        assert_eq!(blocks[1].r, 0);
+        assert_eq!(blocks[0].c_b, 0);
+        assert_eq!(blocks[1].c_b, 255);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_quantizes_constant_one_like_c_reference() -> Result<()> {
+        let mut blocks = vec![BlockQ8HP1::new_zeroed()];
+        k_quants::quantize_row_q8_hp1_ref(&[1.0; QK8_H], &mut blocks)?;
+        assert_eq!(blocks[0].qs, [64; QK8_H]);
+        assert_eq!(blocks[0].m, 0);
+        assert_eq!(blocks[0].padding, [0; 2]);
+        assert_eq!(blocks[0].channel_scale, 0.015625);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_quantizes_left_shift_hierarchy_like_c_reference() -> Result<()> {
+        let mut values = vec![1.0; QK8_H];
+        values.extend(vec![8.0; QK8_H]);
+        let mut blocks = vec![BlockQ8HP1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_hp1_ref(&values, &mut blocks)?;
+        assert_eq!(blocks[0].qs, [64; QK8_H]);
+        assert_eq!(blocks[1].qs, [64; QK8_H]);
+        assert_eq!([blocks[0].m, blocks[1].m], [0, 3]);
+        assert!(blocks.iter().all(|block| block.m >= 0));
+        assert!(blocks.iter().all(|block| block.channel_scale == 0.015625));
+        assert!(blocks.iter().all(|block| block.padding == [0; 2]));
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_zero_block_keeps_shared_row_scale() -> Result<()> {
+        let mut values = vec![0.0; QK8_H];
+        values.extend(vec![8.0; QK8_H]);
+        let mut blocks = vec![BlockQ8HP1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_hp1_ref(&values, &mut blocks)?;
+        assert_eq!(blocks[0].qs, [0; QK8_H]);
+        assert_eq!(blocks[0].m, i16::MIN);
+        assert_eq!(blocks[0].channel_scale, 0.125);
+        assert_eq!(blocks[1].qs, [64; QK8_H]);
+        assert_eq!(blocks[1].m, 0);
+        assert_eq!(blocks[1].channel_scale, 0.125);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_quantizes_all_zero_row_like_c_reference() -> Result<()> {
+        let mut blocks = vec![BlockQ8HP1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_hp1_ref(&[0.0; 64], &mut blocks)?;
+        for block in blocks {
+            assert_eq!(block.qs, [0; QK8_H]);
+            assert_eq!(block.m, i16::MIN);
+            assert_eq!(block.padding, [0; 2]);
+            assert_eq!(block.channel_scale, 0.0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_rejects_invalid_c_reference_inputs() {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut values = [0.0; QK8_H];
+            values[0] = invalid;
+            let mut blocks = vec![BlockQ8HP1::new_zeroed()];
+            assert!(k_quants::quantize_row_q8_hp1_ref(&values, &mut blocks).is_err());
+        }
+
+        let mut blocks = vec![BlockQ8HP1::new_zeroed()];
+        assert!(
+            k_quants::quantize_row_q8_hp1_ref(&[f32::from_bits(1); QK8_H], &mut blocks).is_err()
+        );
+    }
+
+    #[test]
+    fn q8_hp1_rounds_half_away_from_zero() -> Result<()> {
+        let mut values = [0.0; QK8_H];
+        values[0] = 1.0;
+        values[1] = 1.0 / 128.0;
+        values[2] = -1.0 / 128.0;
+        let mut blocks = vec![BlockQ8HP1::new_zeroed()];
+        k_quants::quantize_row_q8_hp1_ref(&values, &mut blocks)?;
+        assert_eq!(blocks[0].qs[0], 64);
+        assert_eq!(blocks[0].qs[1], 1);
+        assert_eq!(blocks[0].qs[2], -1);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h1_qtensor_quantize_isolates_rows() -> Result<()> {
+        let mut values = Vec::new();
+        for (first, second) in [(1.0, -1.0), (8.0, -8.0)] {
+            values.extend(vec![first; QK8_H]);
+            values.extend(vec![second; QK8_H]);
+        }
+        let tensor = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
+        let quantized = QTensor::quantize(&tensor, GgmlDType::Q8H1)?;
+        let blocks = q8_h_tensor_blocks::<BlockQ8H1>(&quantized)?;
+
+        assert_eq!(quantized.shape().dims(), [2, 64]);
+        assert_eq!(quantized.storage_size_in_bytes(), 4 * 44);
+        assert_eq!(blocks.len(), 4);
+        let row0_scale = f16::from_f32(1.0 / 127.0).to_f32();
+        let row1_scale = f16::from_f32(8.0 / 127.0).to_f32();
+        for block in &blocks[..2] {
+            assert_eq!(block.s_rf.to_bits(), row0_scale.to_bits());
+            assert_eq!(block.r, 1);
+        }
+        for block in &blocks[2..] {
+            assert_eq!(block.s_rf.to_bits(), row1_scale.to_bits());
+            assert_eq!(block.r, 1);
+        }
+        assert_ne!(blocks[0].s_rf.to_bits(), blocks[2].s_rf.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_qtensor_quantize_isolates_rows() -> Result<()> {
+        let mut values = Vec::new();
+        for (first, second) in [(1.0, 8.0), (4.0, 32.0)] {
+            values.extend(vec![first; QK8_H]);
+            values.extend(vec![second; QK8_H]);
+        }
+        let tensor = Tensor::from_vec(values, (2, 64), &Device::Cpu)?;
+        let quantized = QTensor::quantize(&tensor, GgmlDType::Q8HP1)?;
+        let blocks = q8_h_tensor_blocks::<BlockQ8HP1>(&quantized)?;
+
+        assert_eq!(quantized.shape().dims(), [2, 64]);
+        assert_eq!(quantized.storage_size_in_bytes(), 4 * 40);
+        assert_eq!(blocks.len(), 4);
+        assert_eq!([blocks[0].m, blocks[1].m], [0, 3]);
+        assert_eq!([blocks[2].m, blocks[3].m], [0, 3]);
+        assert!(blocks[..2]
+            .iter()
+            .all(|block| block.channel_scale == 1.0 / 64.0));
+        assert!(blocks[2..]
+            .iter()
+            .all(|block| block.channel_scale == 1.0 / 16.0));
+        assert!(blocks.iter().all(|block| block.qs == [64; QK8_H]));
+        Ok(())
+    }
+
+    #[test]
+    fn q8_hp1_qtensor_quantize_uses_higher_rank_rows() -> Result<()> {
+        let mut values = Vec::new();
+        for base in [1.0, 2.0, 4.0, 8.0] {
+            values.extend(vec![base; QK8_H]);
+            values.extend(vec![base * 8.0; QK8_H]);
+        }
+        let tensor = Tensor::from_vec(values, (2, 2, 64), &Device::Cpu)?;
+        let quantized = QTensor::quantize(&tensor, GgmlDType::Q8HP1)?;
+        let blocks = q8_h_tensor_blocks::<BlockQ8HP1>(&quantized)?;
+
+        assert_eq!(quantized.shape().dims(), [2, 2, 64]);
+        assert_eq!(quantized.storage_size_in_bytes(), 8 * 40);
+        assert_eq!(blocks.len(), 8);
+        for (row, expected_scale) in [1.0 / 64.0, 1.0 / 32.0, 1.0 / 16.0, 1.0 / 8.0]
+            .into_iter()
+            .enumerate()
+        {
+            let row_blocks = &blocks[row * 2..row * 2 + 2];
+            assert_eq!([row_blocks[0].m, row_blocks[1].m], [0, 3]);
+            assert!(row_blocks
+                .iter()
+                .all(|block| block.channel_scale == expected_scale));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h_qtensor_quantize_zeroes_padding_bytes() -> Result<()> {
+        for (dtype, block_size, padding_ranges) in [
+            (GgmlDType::Q8H1, 44, &[(33, 36), (42, 44)][..]),
+            (GgmlDType::Q8HP1, 40, &[(34, 36)][..]),
+        ] {
+            let tensor = Tensor::from_vec(vec![1.0; 128], (2, 64), &Device::Cpu)?;
+            let quantized = QTensor::quantize(&tensor, dtype)?;
+            let data = quantized.data()?;
+            for block in data.chunks_exact(block_size) {
+                for &(start, end) in padding_ranges {
+                    assert_eq!(&block[start..end], vec![0; end - start]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h_reference_golden_bytes_match_pinned_c() -> Result<()> {
+        // ajou-aisa/llama.cpp-gemmini@d5e76be1fca91314c5a0745038b3cedbbdbed13d
+        let mut h1_values = vec![1.0; QK8_H];
+        h1_values.extend(vec![-1.0; QK8_H]);
+        let mut h1_blocks = vec![BlockQ8H1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_h1_ref(&h1_values, &mut h1_blocks)?;
+        let h1_scale = f16::from_f32(1.0 / 127.0).to_f32();
+        let mut expected_h1 = Vec::new();
+        for q in [127i8, -127i8] {
+            expected_h1.extend(vec![q as u8; QK8_H]);
+            expected_h1.push(0);
+            expected_h1.extend([0; 3]);
+            expected_h1.extend(h1_scale.to_ne_bytes());
+            expected_h1.extend(1u16.to_ne_bytes());
+            expected_h1.extend([0; 2]);
+        }
+        assert_eq!(h1_blocks.as_bytes(), expected_h1);
+
+        let mut hp1_values = vec![1.0; QK8_H];
+        hp1_values.extend(vec![8.0; QK8_H]);
+        let mut hp1_blocks = vec![BlockQ8HP1::new_zeroed(); 2];
+        k_quants::quantize_row_q8_hp1_ref(&hp1_values, &mut hp1_blocks)?;
+        let mut expected_hp1 = Vec::new();
+        for m in [0i16, 3i16] {
+            expected_hp1.extend([64; QK8_H]);
+            expected_hp1.extend(m.to_ne_bytes());
+            expected_hp1.extend([0; 2]);
+            expected_hp1.extend(0.015625f32.to_ne_bytes());
+        }
+        assert_eq!(hp1_blocks.as_bytes(), expected_hp1);
+        Ok(())
+    }
+
+    #[test]
+    fn q8_h_qtensor_dequantization_remains_unsupported() -> Result<()> {
+        for dtype in [GgmlDType::Q8H1, GgmlDType::Q8HP1] {
+            let tensor = Tensor::from_vec(vec![1.0; QK8_H], (QK8_H,), &Device::Cpu)?;
+            let quantized = QTensor::quantize(&tensor, dtype)?;
+            assert!(quantized.dequantize(&Device::Cpu).is_err());
+        }
         Ok(())
     }
 }
@@ -759,6 +1086,50 @@ fn check_shape(shape: &Shape, block_size: usize) -> Result<()> {
     Ok(())
 }
 
+fn quantize_h_cpu(values: &[f32], shape: &Shape, dtype: GgmlDType) -> Result<QStorage> {
+    let Some(&n_per_row) = shape.dims().last() else {
+        crate::bail!("{dtype:?} cannot quantize a scalar tensor")
+    };
+    if n_per_row == 0 {
+        crate::bail!("{dtype:?} row width cannot be zero")
+    }
+    if !n_per_row.is_multiple_of(QK8_H) {
+        crate::bail!("{dtype:?} row width {n_per_row} is not divisible by block size {QK8_H}")
+    }
+    if values.len() != shape.elem_count() || !values.len().is_multiple_of(n_per_row) {
+        crate::bail!(
+            "{dtype:?} flat value count {} is incompatible with shape {shape:?}",
+            values.len()
+        )
+    }
+
+    let blocks_per_row = n_per_row / QK8_H;
+    let block_count = values.len() / QK8_H;
+    match dtype {
+        GgmlDType::Q8H1 => {
+            let mut blocks = vec![BlockQ8H1::new_zeroed(); block_count];
+            for (row, row_blocks) in values
+                .chunks_exact(n_per_row)
+                .zip(blocks.chunks_exact_mut(blocks_per_row))
+            {
+                k_quants::quantize_row_q8_h1_ref(row, row_blocks)?;
+            }
+            Ok(raw_storage_from_blocks(blocks, dtype, QK8_H))
+        }
+        GgmlDType::Q8HP1 => {
+            let mut blocks = vec![BlockQ8HP1::new_zeroed(); block_count];
+            for (row, row_blocks) in values
+                .chunks_exact(n_per_row)
+                .zip(blocks.chunks_exact_mut(blocks_per_row))
+            {
+                k_quants::quantize_row_q8_hp1_ref(row, row_blocks)?;
+            }
+            Ok(raw_storage_from_blocks(blocks, dtype, QK8_H))
+        }
+        _ => crate::bail!("internal misuse of H-family quantizer with {dtype:?}"),
+    }
+}
+
 impl QTensor {
     pub fn new<S: Into<Shape>>(storage: QStorage, shape: S) -> Result<Self> {
         let shape = shape.into();
@@ -774,6 +1145,19 @@ impl QTensor {
         let shape = src.shape();
         let block_size = dtype.block_size();
         check_shape(shape, block_size)?;
+        if matches!(dtype, GgmlDType::Q8H1 | GgmlDType::Q8HP1) {
+            if !src.device().is_cpu() {
+                crate::bail!("{dtype:?} quantization is currently CPU-only")
+            }
+            let shape = shape.clone();
+            let values = src
+                .to_dtype(crate::DType::F32)?
+                .contiguous()?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let storage = quantize_h_cpu(&values, &shape, dtype)?;
+            return Self::new(storage, shape);
+        }
         let src = src.to_dtype(crate::DType::F32)?.flatten_all()?;
         let elem_count = shape.elem_count();
         if !elem_count.is_multiple_of(block_size) {

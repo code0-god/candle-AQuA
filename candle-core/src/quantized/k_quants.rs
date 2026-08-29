@@ -7,6 +7,7 @@ use crate::quantized::utils::{make_qkx3_quants, make_qp_quants};
 use crate::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use half::{bf16, f16, slice::HalfFloatSliceExt};
+use zerocopy::FromZeros;
 
 // Default to QK_K 256 rather than 64.
 pub const QK_K: usize = 256;
@@ -175,6 +176,195 @@ const _: () = {
     assert!(std::mem::offset_of!(BlockQ8HP1, padding) == 34);
     assert!(std::mem::offset_of!(BlockQ8HP1, channel_scale) == 36);
 };
+
+pub(super) fn ilogb_positive_f32(value: f32) -> i32 {
+    debug_assert!(value > 0.0 && value.is_finite());
+    let bits = value.to_bits();
+    let exponent = (bits >> 23) & 0xff;
+    if exponent != 0 {
+        exponent as i32 - 127
+    } else {
+        let mantissa = bits & 0x007f_ffff;
+        debug_assert_ne!(mantissa, 0);
+        (31 - mantissa.leading_zeros()) as i32 - 149
+    }
+}
+
+pub(super) fn pow2_f32(exponent: i32) -> f32 {
+    match exponent {
+        128.. => f32::INFINITY,
+        -126..=127 => f32::from_bits(((exponent + 127) as u32) << 23),
+        -149..=-127 => f32::from_bits(1 << (exponent + 149)),
+        _ => 0.0,
+    }
+}
+
+fn c_min_f32(lhs: f32, rhs: f32) -> f32 {
+    if lhs < rhs {
+        lhs
+    } else {
+        rhs
+    }
+}
+
+fn c_max_f32(lhs: f32, rhs: f32) -> f32 {
+    if lhs > rhs {
+        lhs
+    } else {
+        rhs
+    }
+}
+
+fn validate_h_row(values_len: usize, blocks_len: usize, dtype: GgmlDType) -> Result<()> {
+    if values_len == 0 {
+        crate::bail!("{dtype:?} row cannot be empty")
+    }
+    if !values_len.is_multiple_of(QK8_H) {
+        crate::bail!("{dtype:?} row length {values_len} is not divisible by block size {QK8_H}")
+    }
+    let expected_blocks = values_len / QK8_H;
+    if blocks_len != expected_blocks {
+        crate::bail!("{dtype:?} destination has {blocks_len} blocks, expected {expected_blocks}")
+    }
+    Ok(())
+}
+
+// Reference:
+// ajou-aisa/llama.cpp-gemmini
+// commit d5e76be1fca91314c5a0745038b3cedbbdbed13d
+// ggml/src/ggml-quants.c: quantize_h1_scale_range, quantize_row_q8_h1_ref
+fn quantize_h1_scale_range(min_s: f32, max_s: f32) -> (f32, u16) {
+    if max_s > min_s {
+        let range_step = (max_s - min_s) / 255.0;
+        let offset_step = min_s / 65535.0;
+        let s_rf = c_max_f32(range_step, offset_step);
+        let r = ((min_s as f64) / (s_rf as f64)).round().clamp(0.0, 65535.0) as u16;
+        (s_rf, r)
+    } else if min_s > 0.0 {
+        (min_s, 1)
+    } else {
+        (0.0, 0)
+    }
+}
+
+pub(crate) fn quantize_row_q8_h1_ref(values: &[f32], blocks: &mut [BlockQ8H1]) -> Result<()> {
+    validate_h_row(values.len(), blocks.len(), GgmlDType::Q8H1)?;
+
+    let mut min_s = f32::MAX;
+    let mut max_s = 0.0f32;
+    for (values, block) in values.chunks_exact(QK8_H).zip(blocks.iter_mut()) {
+        let mut amax = 0.0f32;
+        for &value in values {
+            amax = c_max_f32(amax, value.abs());
+        }
+
+        let d = amax / 127.0;
+        let inverse_d = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let s = f16::from_f32(d).to_f32();
+
+        *block = BlockQ8H1::new_zeroed();
+        for (q, &value) in block.qs.iter_mut().zip(values) {
+            *q = (value * inverse_d).round() as i8;
+        }
+        block.s_rf = s;
+        min_s = c_min_f32(min_s, s);
+        max_s = c_max_f32(max_s, s);
+    }
+
+    let (row_s_rf, row_r) = quantize_h1_scale_range(min_s, max_s);
+    for block in blocks {
+        let block_s = block.s_rf;
+        block.s_rf = row_s_rf;
+        block.r = row_r;
+        if row_s_rf > 0.0 {
+            let c_b = ((block_s as f64) / (row_s_rf as f64)).round() as i32 - i32::from(row_r);
+            block.c_b = c_b.clamp(0, 255) as u8;
+        }
+    }
+    Ok(())
+}
+
+// Reference:
+// ajou-aisa/llama.cpp-gemmini
+// commit d5e76be1fca91314c5a0745038b3cedbbdbed13d
+// ggml/src/ggml-quants.c: quantize_q8_hp1_input_valid, quantize_row_q8_hp1_ref
+fn validate_q8_hp1_row(values: &[f32]) -> Result<()> {
+    if values.iter().any(|value| !value.is_finite()) {
+        crate::bail!("Q8HP1 input contains a non-finite value")
+    }
+
+    for values in values.chunks_exact(QK8_H) {
+        let mut amax = 0.0f32;
+        for &value in values {
+            amax = c_max_f32(amax, value.abs());
+        }
+        if amax > 0.0 {
+            let block_exponent = ilogb_positive_f32(amax) - 6;
+            if pow2_f32(block_exponent) == 0.0 {
+                crate::bail!("Q8HP1 block scale underflows to zero")
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn quantize_row_q8_hp1_ref(values: &[f32], blocks: &mut [BlockQ8HP1]) -> Result<()> {
+    validate_h_row(values.len(), blocks.len(), GgmlDType::Q8HP1)?;
+    validate_q8_hp1_row(values)?;
+
+    let mut channel_scale = 0.0f32;
+    let mut channel_set = false;
+    for values in values.chunks_exact(QK8_H) {
+        let mut amax = 0.0f32;
+        for &value in values {
+            amax = c_max_f32(amax, value.abs());
+        }
+        if amax > 0.0 {
+            let block_exponent = ilogb_positive_f32(amax) - 6;
+            let block_scale = pow2_f32(block_exponent);
+            channel_scale = if channel_set {
+                c_min_f32(channel_scale, block_scale)
+            } else {
+                block_scale
+            };
+            channel_set = true;
+        }
+    }
+
+    for block in blocks.iter_mut() {
+        *block = BlockQ8HP1::new_zeroed();
+    }
+    let channel_exponent = if channel_set {
+        ilogb_positive_f32(channel_scale)
+    } else {
+        0
+    };
+
+    for (values, block) in values.chunks_exact(QK8_H).zip(blocks.iter_mut()) {
+        let mut amax = 0.0f32;
+        for &value in values {
+            amax = c_max_f32(amax, value.abs());
+        }
+        block.channel_scale = channel_scale;
+        if amax == 0.0 {
+            block.m = i16::MIN;
+            continue;
+        }
+
+        let block_exponent = ilogb_positive_f32(amax) - 6;
+        let block_scale = pow2_f32(block_exponent);
+        let exponent_offset = block_exponent - channel_exponent;
+        if exponent_offset < 0 {
+            crate::bail!("Q8HP1 exponent offset became negative")
+        }
+        block.m = i16::try_from(exponent_offset)
+            .map_err(|_| crate::Error::Msg("Q8HP1 exponent offset exceeds i16".to_string()))?;
+        for (q, &value) in block.qs.iter_mut().zip(values) {
+            *q = (value / block_scale).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
